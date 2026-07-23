@@ -72,7 +72,7 @@ int main(void)
 {
 
   /* USER CODE BEGIN 1 */
-
+  bsp_length_result_t length_init_result;
   /* USER CODE END 1 */
 
   /* MCU Configuration--------------------------------------------------------*/
@@ -102,8 +102,8 @@ int main(void)
   /* USER CODE BEGIN 2 */
   bsp_path_init();
   bsp_load_init();
-  (void)bsp_length_init();
-  HMI_Process_Init();
+  length_init_result = bsp_length_init();
+  HMI_Process_Init(length_init_result);
   /* USER CODE END 2 */
 
   /* Infinite loop */
