@@ -72,7 +72,7 @@ int main(void)
 {
 
   /* USER CODE BEGIN 1 */
-  bsp_length_result_t length_init_result;
+
   /* USER CODE END 1 */
 
   /* MCU Configuration--------------------------------------------------------*/
@@ -102,8 +102,7 @@ int main(void)
   /* USER CODE BEGIN 2 */
   bsp_path_init();
   bsp_load_init();
-  length_init_result = bsp_length_init();
-  HMI_Process_Init(length_init_result);
+  HMI_Process_Init();
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -168,11 +167,13 @@ void SystemClock_Config(void)
 
 void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim)
 {
+  /* ISR内只转发TIM5捕获事件，周期换算与日志均在主循环完成。 */
   bsp_load_on_tim_capture_irq(htim);
 }
 
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {
+  /* PE0下降沿只发布GP22完成标志，不在中断中访问SPI。 */
   bsp_length_on_gp22_irq(GPIO_Pin);
 }
 

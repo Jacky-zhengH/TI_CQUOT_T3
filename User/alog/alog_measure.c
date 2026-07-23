@@ -2,251 +2,178 @@
 
 #include <stddef.h>
 
+#include "bsp_load.h"
+
 /*
- * 分压参考电阻的标称值已确认为62欧，由APP标定数据传入本模块；
- * 仓库中仍没有电阻分压原理图，因此当前只能集中选择一种接法：
- * 1：参考电阻接3.3 V，未知负载接地，ADC读取两者中点（当前默认）。
- * 0：未知负载接3.3 V，参考电阻接地，ADC读取两者中点。
- * 上板前必须根据原理图或用已知电阻实测确认，APP不感知该硬件方向。
+ * 下列系数借自成功项目，只用于检查“原始量 -> 参考物理量”计算链。
+ * 本机完成10/15/20 m、10/20/30 ohm、100/200/300 pF标定前不得作为精度指标。
  */
-#define ALOG_RESISTANCE_REFERENCE_TO_VREF (1U)
+#define ALOG_GP22_FE9                    (0.002f)
+#define ALOG_PROPAGATION_FACTOR          (2.01546f)
+#define ALOG_LENGTH_BASE_CM              (16.7f)
 
-/* STM32F407的12位ADC满量程码为4095，预留4码防止靠近电源轨时除数失稳。 */
-#define ALOG_ADC_FULL_SCALE_CODE           (4095U)
-#define ALOG_ADC_RAIL_GUARD_CODE           (4U)
+#define ALOG_ADC_REFERENCE_VOLTAGE       (3.3f)
+#define ALOG_ADC_CODE_DIVISOR            (4096.0f)
+#define ALOG_DIVIDER_REFERENCE_OHM       (62.0f)
+#define ALOG_VOLTAGE_GAIN                (1.0072f)
+#define ALOG_VOLTAGE_OFFSET              (-0.0007f)
+#define ALOG_RESISTANCE_GAIN             (0.8615f)
+#define ALOG_RESISTANCE_OFFSET_OHM       (-0.1298f)
+#define ALOG_CABLE_R_OHM_PER_CM          (0.0014f)
+#define ALOG_CABLE_R_OFFSET_OHM          (0.0328f)
 
-#define ALOG_LENGTH_MIN_M                  (0.1f)
-#define ALOG_LENGTH_MAX_M                  (30.0f)
-#define ALOG_CAPACITANCE_MIN_PF            (50.0f)
-#define ALOG_CAPACITANCE_MAX_PF            (400.0f)
+#define ALOG_NE555_R1_MOHM               (0.01f)
+#define ALOG_NE555_R2_MOHM               (1.0f)
+#define ALOG_NE555_FACTOR                (1.442695f)
+#define ALOG_FREQUENCY_GAIN              (1.0048f)
+#define ALOG_FREQUENCY_OFFSET_HZ         (-0.0501f)
+#define ALOG_CAPACITANCE_GAIN            (1.003054914f)
+#define ALOG_CAPACITANCE_OFFSET_PF       (36.6104f)
+#define ALOG_CABLE_C_PF_PER_CM           (0.9527f)
+#define ALOG_CABLE_C_OFFSET_PF           (1.4487f)
 
-bool alog_average_i32(const int32_t *samples,
-                      uint16_t count,
-                      int32_t *average)
+#define ALOG_INVALID_RESULT              (-1.0f)
+
+uint16_t alog_average_u16(const uint16_t *data, uint16_t count)
+{
+    uint32_t sum = 0U;
+    uint16_t index;
+
+    if ((data == NULL) || (count == 0U))
+    {
+        return 0U;
+    }
+
+    for (index = 0U; index < count; index++)
+    {
+        sum += data[index];
+    }
+    return (uint16_t)(sum / count);
+}
+
+uint32_t alog_average_u32(const uint32_t *data, uint16_t count)
+{
+    uint64_t sum = 0U;
+    uint16_t index;
+
+    if ((data == NULL) || (count == 0U))
+    {
+        return 0U;
+    }
+
+    for (index = 0U; index < count; index++)
+    {
+        sum += data[index];
+    }
+    return (uint32_t)(sum / count);
+}
+
+uint32_t alog_average_tdc(const uint32_t *data, uint16_t count)
 {
     int64_t sum = 0;
+    int32_t average;
     uint16_t index;
 
-    if ((samples == NULL) || (average == NULL) || (count == 0U))
+    if ((data == NULL) || (count == 0U))
     {
-        return false;
+        return 0U;
     }
+
     for (index = 0U; index < count; index++)
     {
-        sum += samples[index];
+        /* GP22 RES0是有符号16.16，求和前必须按int32_t恢复符号。 */
+        sum += (int32_t)data[index];
     }
-    *average = (int32_t)(sum / (int64_t)count);
-    return true;
+    average = (int32_t)(sum / (int64_t)count);
+    return (uint32_t)average;
 }
 
-bool alog_average_u16(const uint16_t *samples,
-                      uint16_t count,
-                      uint16_t *average)
+float alog_length_reference_cm(uint32_t raw)
 {
-    uint32_t sum = 0U;
-    uint16_t index;
+    float signed_fixed;
+    float time_ns;
 
-    if ((samples == NULL) || (average == NULL) || (count == 0U))
-    {
-        return false;
-    }
-    for (index = 0U; index < count; index++)
-    {
-        sum += samples[index];
-    }
-    *average = (uint16_t)(sum / (uint32_t)count);
-    return true;
+    /* 高16位为有符号整数、低16位为小数，不能直接把raw转成float。 */
+    signed_fixed = (float)(int16_t)(raw >> 16U);
+    signed_fixed += (float)(raw & 0xFFFFU) / 65536.0f;
+    time_ns = signed_fixed / ALOG_GP22_FE9;
+    return (time_ns * ALOG_PROPAGATION_FACTOR * 0.5f * 10.0f) -
+           ALOG_LENGTH_BASE_CM;
 }
 
-bool alog_average_u32(const uint32_t *samples,
-                      uint16_t count,
-                      uint32_t *average)
+float alog_resistance_reference_ohm(uint16_t adc,
+                                    float cable_length_cm)
 {
-    uint64_t sum = 0U;
-    uint16_t index;
+    float voltage_raw;
+    float voltage_sim;
+    float denominator;
+    float resistance_calculated;
+    float resistance_sim;
+    float cable_resistance;
+    float load_resistance;
 
-    if ((samples == NULL) || (average == NULL) || (count == 0U))
+    voltage_raw = (float)adc * ALOG_ADC_REFERENCE_VOLTAGE /
+                  ALOG_ADC_CODE_DIVISOR;
+    voltage_sim = (voltage_raw * ALOG_VOLTAGE_GAIN) +
+                  ALOG_VOLTAGE_OFFSET;
+    denominator = ALOG_ADC_REFERENCE_VOLTAGE - voltage_sim;
+    if ((voltage_sim <= 0.0f) || (denominator <= 0.0f))
     {
-        return false;
+        return ALOG_INVALID_RESULT;
     }
-    for (index = 0U; index < count; index++)
-    {
-        sum += samples[index];
-    }
-    *average = (uint32_t)(sum / (uint64_t)count);
-    return true;
+
+    /*
+     * 实际拓扑必须是3.3 V -> 62 ohm -> ADC节点 -> 负载 -> GND，
+     * 因而Rload = 62 * Vadc / (3.3 - Vadc)。
+     */
+    resistance_calculated = ALOG_DIVIDER_REFERENCE_OHM *
+                            voltage_sim / denominator;
+    resistance_sim = (ALOG_RESISTANCE_GAIN * resistance_calculated) +
+                     ALOG_RESISTANCE_OFFSET_OHM;
+    cable_resistance = (ALOG_CABLE_R_OHM_PER_CM * cable_length_cm) +
+                       ALOG_CABLE_R_OFFSET_OHM;
+    load_resistance = resistance_sim - cable_resistance;
+    return (load_resistance >= 0.0f) ?
+           load_resistance : ALOG_INVALID_RESULT;
 }
 
-bool alog_stats_u16(const uint16_t *samples,
-                    uint16_t count,
-                    uint16_t *minimum,
-                    uint16_t *maximum,
-                    uint16_t *average)
+float alog_capacitance_reference_pf(uint32_t period_ticks,
+                                    float cable_length_cm)
 {
-    uint32_t sum = 0U;
-    uint16_t min_value;
-    uint16_t max_value;
-    uint16_t index;
+    float frequency_raw;
+    float frequency_sim;
+    float resistance_sum;
+    float total_calculated_pf;
+    float total_sim_pf;
+    float cable_capacitance_pf;
+    float load_capacitance_pf;
 
-    if ((samples == NULL) || (count == 0U) ||
-        (minimum == NULL) || (maximum == NULL) || (average == NULL))
+    if (period_ticks == 0U)
     {
-        return false;
+        return ALOG_INVALID_RESULT;
     }
 
-    min_value = samples[0];
-    max_value = samples[0];
-    for (index = 0U; index < count; index++)
+    /* TIM5返回周期Tick；先换成频率，再代入NE555无稳态公式。 */
+    frequency_raw = TIM5_CAPTURE_TICK_HZ / (float)period_ticks;
+    frequency_sim = (frequency_raw * ALOG_FREQUENCY_GAIN) +
+                    ALOG_FREQUENCY_OFFSET_HZ;
+    resistance_sum = ALOG_NE555_R1_MOHM +
+                     (2.0f * ALOG_NE555_R2_MOHM);
+    if ((frequency_sim <= 0.0f) || (resistance_sum <= 0.0f))
     {
-        if (samples[index] < min_value)
-        {
-            min_value = samples[index];
-        }
-        if (samples[index] > max_value)
-        {
-            max_value = samples[index];
-        }
-        sum += samples[index];
+        return ALOG_INVALID_RESULT;
     }
 
-    *minimum = min_value;
-    *maximum = max_value;
-    *average = (uint16_t)(sum / (uint32_t)count);
-    return true;
-}
-
-bool alog_stats_u32(const uint32_t *samples,
-                    uint16_t count,
-                    uint32_t *minimum,
-                    uint32_t *maximum,
-                    uint32_t *average)
-{
-    uint64_t sum = 0U;
-    uint32_t min_value;
-    uint32_t max_value;
-    uint16_t index;
-
-    if ((samples == NULL) || (count == 0U) ||
-        (minimum == NULL) || (maximum == NULL) || (average == NULL))
-    {
-        return false;
-    }
-
-    min_value = samples[0];
-    max_value = samples[0];
-    for (index = 0U; index < count; index++)
-    {
-        if (samples[index] < min_value)
-        {
-            min_value = samples[index];
-        }
-        if (samples[index] > max_value)
-        {
-            max_value = samples[index];
-        }
-        sum += samples[index];
-    }
-
-    *minimum = min_value;
-    *maximum = max_value;
-    *average = (uint32_t)(sum / (uint64_t)count);
-    return true;
-}
-
-bool alog_length_from_raw(int32_t raw,
-                          const bsp_calibration_data_t *cal,
-                          float *length_m)
-{
-    float calculated_length_m;
-
-    if ((cal == NULL) || (length_m == NULL) ||
-        ((cal->valid_mask & BSP_CAL_VALID_LENGTH) == 0U))
-    {
-        return false;
-    }
-
-    calculated_length_m =
-        ((cal->length_gain_cm_per_raw * (float)raw) +
-         cal->length_offset_cm) /
-        100.0f;
-    /* 合并范围判断也会拒绝NaN，避免损坏标定记录产生虚假有效值。 */
-    if (!((calculated_length_m >= ALOG_LENGTH_MIN_M) &&
-          (calculated_length_m <= ALOG_LENGTH_MAX_M)))
-    {
-        return false;
-    }
-
-    *length_m = calculated_length_m;
-    return true;
-}
-
-bool alog_resistance_from_adc(uint16_t adc_average,
-                              float length_m,
-                              const bsp_calibration_data_t *cal,
-                              float *resistance_ohm)
-{
-    float ratio;
-    float total_resistance_ohm;
-    float calculated_resistance_ohm;
-
-    if ((cal == NULL) || (resistance_ohm == NULL) ||
-        ((cal->valid_mask & BSP_CAL_VALID_RESISTANCE) == 0U) ||
-        (!(cal->resistance_reference_ohm > 0.0f)) ||
-        (!(length_m >= 0.0f)) ||
-        (adc_average <= ALOG_ADC_RAIL_GUARD_CODE) ||
-        (adc_average >=
-         (ALOG_ADC_FULL_SCALE_CODE - ALOG_ADC_RAIL_GUARD_CODE)))
-    {
-        return false;
-    }
-
-    ratio = (float)adc_average / (float)ALOG_ADC_FULL_SCALE_CODE;
-#if ALOG_RESISTANCE_REFERENCE_TO_VREF
-    total_resistance_ohm =
-        cal->resistance_reference_ohm * ratio / (1.0f - ratio);
-#else
-    total_resistance_ohm =
-        cal->resistance_reference_ohm * (1.0f - ratio) / ratio;
-#endif
-
-    calculated_resistance_ohm =
-        (cal->resistance_gain * total_resistance_ohm) +
-        cal->resistance_offset_ohm -
-        (cal->cable_resistance_ohm_per_m * length_m);
-    if (!(calculated_resistance_ohm >= 0.0f))
-    {
-        return false;
-    }
-
-    *resistance_ohm = calculated_resistance_ohm;
-    return true;
-}
-
-bool alog_capacitance_from_period(uint32_t open_period_ticks,
-                                  uint32_t load_period_ticks,
-                                  const bsp_calibration_data_t *cal,
-                                  float *capacitance_pf)
-{
-    uint32_t delta_ticks;
-    float calculated_capacitance_pf;
-
-    if ((cal == NULL) || (capacitance_pf == NULL) ||
-        ((cal->valid_mask & BSP_CAL_VALID_CAPACITANCE) == 0U) ||
-        (load_period_ticks <= open_period_ticks))
-    {
-        return false;
-    }
-
-    delta_ticks = load_period_ticks - open_period_ticks;
-    calculated_capacitance_pf =
-        (cal->capacitance_gain_pf_per_tick * (float)delta_ticks) +
-        cal->capacitance_offset_pf;
-    if (!((calculated_capacitance_pf >= ALOG_CAPACITANCE_MIN_PF) &&
-          (calculated_capacitance_pf <= ALOG_CAPACITANCE_MAX_PF)))
-    {
-        return false;
-    }
-
-    *capacitance_pf = calculated_capacitance_pf;
-    return true;
+    total_calculated_pf = 1000000.0f * ALOG_NE555_FACTOR /
+                          resistance_sum / frequency_sim;
+    total_sim_pf = ALOG_CAPACITANCE_GAIN *
+                   (total_calculated_pf -
+                    ALOG_CAPACITANCE_OFFSET_PF);
+    /* 总电容减去按最近长度估计的电缆寄生，才得到终端负载参考值。 */
+    cable_capacitance_pf =
+        (ALOG_CABLE_C_PF_PER_CM * cable_length_cm) +
+        ALOG_CABLE_C_OFFSET_PF;
+    load_capacitance_pf = total_sim_pf - cable_capacitance_pf;
+    return (load_capacitance_pf >= 0.0f) ?
+           load_capacitance_pf : ALOG_INVALID_RESULT;
 }

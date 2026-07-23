@@ -97,15 +97,6 @@ void MX_TIM1_Init(void)
   }
   /* USER CODE BEGIN TIM1_Init 2 */
 
-  /*
-   * .ioc已配置168个计数周期、84个高电平Tick；当前生成文件仍保留旧值。
-   * 在受保护区把寄存器校正为500 ns高电平、1 us周期，BSP不再重配TIM1。
-   */
-  __HAL_TIM_SET_AUTORELOAD(&htim1, 167U);
-  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, 84U);
-  htim1.Instance->EGR = TIM_EGR_UG;
-  __HAL_TIM_CLEAR_FLAG(&htim1, TIM_FLAG_UPDATE);
-
   /* USER CODE END TIM1_Init 2 */
   HAL_TIM_MspPostInit(&htim1);
 

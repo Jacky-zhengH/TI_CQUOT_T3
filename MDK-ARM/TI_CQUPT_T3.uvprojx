@@ -1140,11 +1140,6 @@
           <GroupName>User/bsp</GroupName>
           <Files>
             <File>
-              <FileName>bsp_board.h</FileName>
-              <FileType>5</FileType>
-              <FilePath>..\User\bsp\bsp_board.h</FilePath>
-            </File>
-            <File>
               <FileName>bsp_path.c</FileName>
               <FileType>1</FileType>
               <FilePath>..\User\bsp\bsp_path.c</FilePath>
@@ -1153,16 +1148,6 @@
               <FileName>bsp_path.h</FileName>
               <FileType>5</FileType>
               <FilePath>..\User\bsp\bsp_path.h</FilePath>
-            </File>
-            <File>
-              <FileName>bsp_load.c</FileName>
-              <FileType>1</FileType>
-              <FilePath>..\User\bsp\bsp_load.c</FilePath>
-            </File>
-            <File>
-              <FileName>bsp_load.h</FileName>
-              <FileType>5</FileType>
-              <FilePath>..\User\bsp\bsp_load.h</FilePath>
             </File>
             <File>
               <FileName>bsp_length.c</FileName>
@@ -1175,14 +1160,14 @@
               <FilePath>..\User\bsp\bsp_length.h</FilePath>
             </File>
             <File>
-              <FileName>bsp_flash.c</FileName>
+              <FileName>bsp_load.c</FileName>
               <FileType>1</FileType>
-              <FilePath>..\User\bsp\bsp_flash.c</FilePath>
+              <FilePath>..\User\bsp\bsp_load.c</FilePath>
             </File>
             <File>
-              <FileName>bsp_flash.h</FileName>
+              <FileName>bsp_load.h</FileName>
               <FileType>5</FileType>
-              <FilePath>..\User\bsp\bsp_flash.h</FilePath>
+              <FilePath>..\User\bsp\bsp_load.h</FilePath>
             </File>
           </Files>
         </Group>

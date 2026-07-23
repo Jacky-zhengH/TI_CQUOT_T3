@@ -1,51 +1,25 @@
 #ifndef ALOG_MEASURE_H
 #define ALOG_MEASURE_H
 
-#include <stdbool.h>
 #include <stdint.h>
 
-#include "bsp_flash.h"
+/* 置1明确表示当前物理量仅为跨项目参考模拟值，不是本机标定结果。 */
+#define ALOG_REFERENCE_SIMULATION_ONLY (1)
 
-/* 原始样本统计；物理量换算将在获得实测标定参数后继续放在本层。 */
-bool alog_average_i32(const int32_t *samples,
-                      uint16_t count,
-                      int32_t *average);
-bool alog_average_u16(const uint16_t *samples,
-                      uint16_t count,
-                      uint16_t *average);
-bool alog_average_u32(const uint32_t *samples,
-                      uint16_t count,
-                      uint32_t *average);
+/** @brief 普通uint16_t算术平均；空数组返回0。 */
+uint16_t alog_average_u16(const uint16_t *data, uint16_t count);
+/** @brief 使用uint64_t累加，避免周期Tick求和溢出。 */
+uint32_t alog_average_u32(const uint32_t *data, uint16_t count);
+/** @brief 按有符号16.16原始值平均，返回位模式仍为uint32_t。 */
+uint32_t alog_average_tdc(const uint32_t *data, uint16_t count);
 
-/** @brief 统计uint16_t数组的最小值、最大值和平均值。 */
-bool alog_stats_u16(const uint16_t *samples,
-                    uint16_t count,
-                    uint16_t *minimum,
-                    uint16_t *maximum,
-                    uint16_t *average);
-
-/** @brief 统计uint32_t数组的最小值、最大值和平均值。 */
-bool alog_stats_u32(const uint32_t *samples,
-                    uint16_t count,
-                    uint32_t *minimum,
-                    uint32_t *maximum,
-                    uint32_t *average);
-
-/** @brief 使用Flash线性标定将GP22原始值换算为电缆长度。 */
-bool alog_length_from_raw(int32_t raw,
-                          const bsp_calibration_data_t *cal,
-                          float *length_m);
-
-/** @brief 使用分压模型和Flash标定计算终端负载电阻。 */
-bool alog_resistance_from_adc(uint16_t adc_average,
-                              float length_m,
-                              const bsp_calibration_data_t *cal,
-                              float *resistance_ohm);
-
-/** @brief 使用开路周期差和Flash线性标定计算终端电容。 */
-bool alog_capacitance_from_period(uint32_t open_period_ticks,
-                                  uint32_t load_period_ticks,
-                                  const bsp_calibration_data_t *cal,
-                                  float *capacitance_pf);
+/** @brief 使用参考模拟系数把GP22 RES0换算为厘米。 */
+float alog_length_reference_cm(uint32_t raw);
+/** @brief 按62 ohm分压和电缆寄生参考系数计算终端电阻。 */
+float alog_resistance_reference_ohm(uint16_t adc,
+                                    float cable_length_cm);
+/** @brief 按NE555周期和电缆寄生参考系数计算终端电容。 */
+float alog_capacitance_reference_pf(uint32_t period_ticks,
+                                    float cable_length_cm);
 
 #endif /* ALOG_MEASURE_H */
