@@ -1,0 +1,384 @@
+#include "header.h"
+#include "app_process.h"
+
+#include "alog_measure.h"
+#include "bsp_board.h"
+#include "bsp_flash.h"
+#include "bsp_length.h"
+#include "bsp_load.h"
+#include "bsp_path.h"
+
+//*********************************************************************************************************
+extern UART_HandleTypeDef huart1; // HMI 控制串口
+extern UART_HandleTypeDef huart3; // PC 调试串口
+//*********************************************************************************************************
+
+static uint8_t hmi_rx_buffer[1];          // HMI 单字节命令接收缓冲区
+static char debug_buffer[160];            // PC串口调试发送缓冲区
+static volatile uint8_t hmi_cmd_flag = 0; // 新命令标志位
+static volatile uint8_t hmi_cmd_data = 0; // 最新命令字节
+//*********************************************************************************************************
+#define APP_MEASURE_TOTAL_TIMEOUT_MS (5000U)
+#define APP_LENGTH_SAMPLE_COUNT (32U)
+#define APP_LENGTH_SINGLE_TIMEOUT_MS (20U)
+#define APP_ADC_SAMPLE_COUNT (32U)
+#define APP_PERIOD_SAMPLE_COUNT (16U)
+#define APP_CAPTURE_TIMEOUT_MS (500U)
+#define APP_HMI_CMD_BUFFER_SIZE (100U)
+#define APP_HMI_TERMINATOR_SIZE (3U)
+#define APP_UART_TX_TIMEOUT_MS (100U)
+
+/* 三类测量不会并发，共用缓冲区可避免为电赛单任务流程重复占用RAM。 */
+typedef union
+{
+    int32_t length_raw[APP_LENGTH_SAMPLE_COUNT];
+    uint16_t resistance_adc[APP_ADC_SAMPLE_COUNT];
+    uint32_t capacitance_period[APP_PERIOD_SAMPLE_COUNT];
+} app_measure_buffer_t;
+
+static app_measure_buffer_t s_measure_buffer;
+static bsp_calibration_data_t g_calibration;
+
+static uint32_t app_remaining_ms(uint32_t start_ms)
+{
+    uint32_t elapsed_ms = bsp_now_ms() - start_ms;
+
+    return (elapsed_ms < APP_MEASURE_TOTAL_TIMEOUT_MS) ? (APP_MEASURE_TOTAL_TIMEOUT_MS - elapsed_ms) : 0U;
+}
+
+//=========================================================================================================
+// 1. 基础功能函数
+//=========================================================================================================
+/**
+ * @name HMI_Process_Init
+ * @brief 启动应用层接收与测量任务框架
+ */
+void HMI_Process_Init(void)
+{
+    bsp_flash_result_t flash_result;
+
+    memset(&g_calibration, 0, sizeof(g_calibration));
+    flash_result = bsp_flash_load(&g_calibration);
+    if (flash_result == BSP_FLASH_RESULT_OK)
+    {
+        Debug_printf("[FLASH] calibration loaded, valid_mask=0x%08lX\r\n",
+                     (unsigned long)g_calibration.valid_mask);
+    }
+    else
+    {
+        /*
+         * 擦除态或损坏记录都使用valid_mask=0的安全RAM副本。
+         * 原始采集仍可运行，且初始化阶段不会自动擦写Flash。
+         */
+        memset(&g_calibration, 0, sizeof(g_calibration));
+        Debug_printf("[FLASH] no valid calibration, result=%u, raw mode\r\n",
+                     (unsigned int)flash_result);
+    }
+
+    HAL_UART_Receive_IT(&huart1, hmi_rx_buffer, 1);
+}
+
+/**
+ * @name    HMI_Send_Cmd
+ * @brief   向HMI串口屏发送原始指令
+ */
+void HMI_Send_Cmd(const char *cmd_string)
+{
+    char cmd_buffer[APP_HMI_CMD_BUFFER_SIZE];
+    int len;
+    uint16_t tx_length;
+
+    if (cmd_string == NULL)
+    {
+        return;
+    }
+
+    /*
+     * 预留结尾'\0'和HMI要求的3个0xFF，超长命令只截断正文，
+     * 不会把snprintf返回的“理论长度”误当成实际缓冲区长度发送。
+     */
+    len = snprintf(cmd_buffer,
+                   sizeof(cmd_buffer),
+                   "%.*s\xff\xff\xff",
+                   (int)(sizeof(cmd_buffer) -
+                         APP_HMI_TERMINATOR_SIZE - 1U),
+                   cmd_string);
+    if (len > 0)
+    {
+        tx_length = ((size_t)len < sizeof(cmd_buffer)) ? (uint16_t)len : (uint16_t)(sizeof(cmd_buffer) - 1U);
+        (void)HAL_UART_Transmit(&huart1,
+                                (uint8_t *)cmd_buffer,
+                                tx_length,
+                                APP_UART_TX_TIMEOUT_MS);
+    }
+}
+
+/**
+ * @name    Debug_printf
+ * @brief   PC串口调试打印
+ */
+void Debug_printf(const char *text, ...)
+{
+    va_list args;
+    int len;
+    uint16_t tx_length;
+
+    if (text == NULL)
+    {
+        return;
+    }
+
+    va_start(args, text);
+    len = vsnprintf(debug_buffer, sizeof(debug_buffer), text, args);
+    va_end(args);
+
+    if (len > 0)
+    {
+        tx_length = ((size_t)len < sizeof(debug_buffer)) ? (uint16_t)len : (uint16_t)(sizeof(debug_buffer) - 1U);
+        (void)HAL_UART_Transmit(&huart3,
+                                (uint8_t *)debug_buffer,
+                                tx_length,
+                                APP_UART_TX_TIMEOUT_MS);
+    }
+}
+//=========================================================================================================
+// 2. app层辅助任务函数
+//=========================================================================================================
+bsp_flash_result_t App_Calibration_Save(void)
+{
+    bsp_flash_result_t result;
+
+    /*
+     * 此入口只应由“用户明确保存标定”流程在主循环调用。
+     * 先断开全部继电器，Flash擦写失败也保留g_calibration的RAM内容。
+     */
+    bsp_path_off();
+    result = bsp_flash_save(&g_calibration);
+    Debug_printf("[FLASH] calibration save result=%u\r\n",
+                 (unsigned int)result);
+    return result;
+}
+
+static void app_run_length_measurement(void)
+{
+    uint32_t start_ms = bsp_now_ms();
+    uint32_t remaining_ms;
+    uint32_t single_timeout_ms;
+    uint16_t status_register;
+    uint16_t sample_index;
+    int32_t raw_average;
+    bsp_length_result_t result = BSP_LENGTH_RESULT_NOT_READY;
+    bool success = false;
+
+    Debug_printf("[LENGTH] 正在检测\r\n");
+    if (!bsp_path_select(BSP_PATH_LENGTH))
+    {
+        Debug_printf("[LENGTH] path error\r\n");
+        goto cleanup;
+    }
+
+    for (sample_index = 0U;
+         sample_index < APP_LENGTH_SAMPLE_COUNT;
+         sample_index++)
+    {
+        remaining_ms = app_remaining_ms(start_ms);
+        if (remaining_ms == 0U)
+        {
+            result = BSP_LENGTH_RESULT_TIMEOUT;
+            goto cleanup;
+        }
+        single_timeout_ms = (remaining_ms < APP_LENGTH_SINGLE_TIMEOUT_MS) ? remaining_ms : APP_LENGTH_SINGLE_TIMEOUT_MS;
+        result = bsp_length_measure_raw(&s_measure_buffer.length_raw[sample_index],
+                                        &status_register,
+                                        single_timeout_ms);
+        if (result != BSP_LENGTH_RESULT_OK)
+        {
+            goto cleanup;
+        }
+    }
+
+    if (!alog_average_i32(s_measure_buffer.length_raw,
+                          APP_LENGTH_SAMPLE_COUNT,
+                          &raw_average))
+    {
+        goto cleanup;
+    }
+
+    /* 缺少电缆速度系数和两点标定值，只报告真实原始平均值。 */
+    Debug_printf("[LENGTH] raw_avg=%ld, calibration required\r\n",
+                 (long)raw_average);
+    success = true;
+
+cleanup:
+    bsp_path_off();
+    if (success)
+    {
+        Debug_printf("[LENGTH] 结果保持 raw only, elapsed=%lu ms\r\n",
+                     (unsigned long)(bsp_now_ms() - start_ms));
+    }
+    else
+    {
+        Debug_printf("[LENGTH] failed result=%u, elapsed=%lu ms\r\n",
+                     (unsigned int)result,
+                     (unsigned long)(bsp_now_ms() - start_ms));
+    }
+}
+
+static void app_run_load_measurement(void)
+{
+    uint32_t start_ms = bsp_now_ms();
+    uint32_t remaining_ms;
+    uint32_t capture_timeout_ms;
+    uint32_t period_average;
+    uint32_t capture_tick_hz;
+    uint16_t adc_average;
+    bsp_load_result_t adc_result = BSP_LOAD_RESULT_NOT_READY;
+    bsp_load_result_t period_result = BSP_LOAD_RESULT_NOT_READY;
+    bool adc_valid = false;
+    bool period_valid = false;
+
+    Debug_printf("[LOAD] 正在检测\r\n");
+    if (bsp_path_select(BSP_PATH_RESISTANCE))
+    {
+        adc_result = bsp_load_read_adc(s_measure_buffer.resistance_adc,
+                                       APP_ADC_SAMPLE_COUNT);
+        if ((adc_result == BSP_LOAD_RESULT_OK) &&
+            alog_average_u16(s_measure_buffer.resistance_adc,
+                             APP_ADC_SAMPLE_COUNT,
+                             &adc_average))
+        {
+            adc_valid = true;
+            Debug_printf("[LOAD] adc_avg=%u, calibration required\r\n",
+                         (unsigned int)adc_average);
+        }
+        else
+        {
+            Debug_printf("[LOAD] ADC raw failed result=%u\r\n",
+                         (unsigned int)adc_result);
+        }
+    }
+    else
+    {
+        Debug_printf("[LOAD] resistance path error\r\n");
+    }
+
+    /*
+     * ADC和NE555是两条独立的原始采集链路：任一路失败都只记录本路错误，
+     * 不抹掉另一条已成功的数据，也不在缺少标定时伪造负载分类结果。
+     */
+    remaining_ms = app_remaining_ms(start_ms);
+    if (remaining_ms == 0U)
+    {
+        period_result = BSP_LOAD_RESULT_TIMEOUT;
+    }
+    else if (!bsp_path_select(BSP_PATH_CAPACITANCE))
+    {
+        Debug_printf("[LOAD] capacitance path error\r\n");
+    }
+    else
+    {
+        capture_timeout_ms = (remaining_ms < APP_CAPTURE_TIMEOUT_MS) ? remaining_ms : APP_CAPTURE_TIMEOUT_MS;
+        period_result = bsp_load_capture_periods(
+            s_measure_buffer.capacitance_period,
+            APP_PERIOD_SAMPLE_COUNT,
+            capture_timeout_ms);
+        if ((period_result == BSP_LOAD_RESULT_OK) &&
+            alog_average_u32(s_measure_buffer.capacitance_period,
+                             APP_PERIOD_SAMPLE_COUNT,
+                             &period_average))
+        {
+            period_valid = true;
+            capture_tick_hz = bsp_load_get_capture_tick_hz();
+            Debug_printf("[LOAD] NE555 period_avg=%lu ticks, tick_hz=%lu, calibration required\r\n",
+                         (unsigned long)period_average,
+                         (unsigned long)capture_tick_hz);
+        }
+    }
+
+    bsp_path_off();
+    if (!period_valid)
+    {
+        Debug_printf("[LOAD] NE555 raw failed result=%u\r\n",
+                     (unsigned int)period_result);
+    }
+    Debug_printf("[LOAD] raw done adc=%s, ne555=%s, elapsed=%lu ms\r\n",
+                 adc_valid ? "OK" : "FAIL",
+                 period_valid ? "OK" : "FAIL",
+                 (unsigned long)(bsp_now_ms() - start_ms));
+}
+//=========================================================================================================
+// 3. 应用任务函数
+//=========================================================================================================
+/**
+ * @name   Task_Button_Poll
+ * @brief  按键响应函数，放入主循环轮询中，按键触发后修改状态机状态
+ */
+static void Task_Button_Poll(void)
+{
+    uint8_t cmd;
+
+    if (hmi_cmd_flag == 0U)
+    {
+        return;
+    }
+
+    __disable_irq(); // 屏蔽中断
+    cmd = hmi_cmd_data;
+    hmi_cmd_flag = 0;
+    __enable_irq(); // 恢复中断屏蔽
+
+    HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
+    Debug_printf("[KEY] RX cmd='%c' hex=0x%02X\r\n", cmd, cmd);
+    if (cmd == 'A')
+    {
+        Debug_printf("[KEY]cmd=A| xxxx \r\n");
+        app_run_length_measurement();
+    }
+    else if (cmd == 'B')
+    {
+        Debug_printf("[KEY]cmd=B| xxxx \r\n");
+        app_run_load_measurement();
+    }
+    else
+    {
+        Debug_printf("[KEY] Unknown cmd|use 'A'=XXXX, 'B'=YYYY.\r\n");
+    }
+}
+//=========================================================================================================
+// 4. 主轮询整合
+//=========================================================================================================
+/**
+ * @name   App_Main_Process_Poll
+ * @brief  放在main.c的while(1)中，统筹调度所有应用任务
+ */
+void App_Main_Process_Poll(void)
+{
+    Task_Button_Poll();
+}
+//=========================================================================================================
+// 5. 中断回调
+//=========================================================================================================
+/**
+ * @brief USART接收完成回调，只保存命令并重启接收
+ */
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+    if ((huart != NULL) && (huart->Instance == USART1))
+    {
+        hmi_cmd_data = hmi_rx_buffer[0];
+        hmi_cmd_flag = 1;
+        HAL_UART_Receive_IT(huart, hmi_rx_buffer, 1);
+    }
+}
+
+/**
+ * @brief USART1发生噪声、帧或溢出错误后恢复单字节中断接收。
+ * @note 回调运行在中断上下文，只重启接收，不执行日志或Flash操作。
+ */
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
+{
+    if ((huart != NULL) && (huart->Instance == USART1))
+    {
+        (void)HAL_UART_Receive_IT(huart, hmi_rx_buffer, 1);
+    }
+}

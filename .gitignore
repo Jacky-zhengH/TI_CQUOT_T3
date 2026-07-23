@@ -1,0 +1,43 @@
+# Keil MDK 编译输出（可由 .uvprojx 重新生成）
+/MDK-ARM/TI_CQUPT_T3/
+/MDK-ARM/*.lst
+/MDK-ARM/*.log
+*.o
+*.d
+*.crf
+*.axf
+*.elf
+*.hex
+*.bin
+*.map
+*.lnp
+*.dep
+*.build_log.htm
+
+# Keil 本机用户界面、调试会话和备份文件
+*.uvguix.*
+*.uvgui.*
+*.uvoptx
+*.dbgconf
+*.Bak
+*.bak
+
+# 当前工程未引用的 CMSIS 文档、算法库、示例和 RTOS 资源
+/Drivers/CMSIS/Core/
+/Drivers/CMSIS/Core_A/
+/Drivers/CMSIS/DAP/
+/Drivers/CMSIS/Documentation/
+/Drivers/CMSIS/DSP/
+/Drivers/CMSIS/NN/
+/Drivers/CMSIS/RTOS/
+/Drivers/CMSIS/RTOS2/
+
+# 编辑器、操作系统和本地辅助目录
+.vscode/
+.idea/
+.agents/
+.codex/
+.DS_Store
+Thumbs.db
+*.tmp
+*.lock
