@@ -33,6 +33,8 @@ static volatile uint8_t hmi_cmd_data = 0; // 最新命令字节
 #define APP_UART_TX_TIMEOUT_MS (100U)
 #define APP_RESISTANCE_CANDIDATE_MIN_OHM (5.0f)
 #define APP_RESISTANCE_CANDIDATE_MAX_OHM (50.0f)
+/* 已确认的板上分压参考电阻标称值；实测标定值仍以Flash记录为准。 */
+#define APP_FACTORY_RESISTANCE_REFERENCE_OHM (62.0f)
 #define APP_LOAD_CALIBRATION_MASK \
     (BSP_CAL_VALID_RESISTANCE | BSP_CAL_VALID_CAPACITANCE)
 #define APP_ALL_PHYSICAL_CALIBRATION_MASK \
@@ -68,10 +70,16 @@ static app_measure_context_t g_measure_context;
 static bsp_length_result_t g_length_init_result;
 
 /*
- * 工厂默认标定值集中保留在这里。当前全部为0且valid_mask为0，
- * 只允许原始采集；量产或比赛标定值必须由真实测量后显式写入Flash。
+ * 工厂默认值只填入已经确认的62欧分压参考电阻。
+ * valid_mask和其余标定项仍保持0，分压方向、增益、偏移及电缆补偿
+ * 必须经原理图确认或真实测量后，才允许显式写入Flash并启用物理量输出。
  */
-static const bsp_calibration_data_t s_factory_calibration = {0U};
+static void app_set_factory_calibration(void)
+{
+    memset(&g_calibration, 0, sizeof(g_calibration));
+    g_calibration.resistance_reference_ohm =
+        APP_FACTORY_RESISTANCE_REFERENCE_OHM;
+}
 
 static uint32_t app_remaining_ms(uint32_t start_ms)
 {
@@ -138,7 +146,7 @@ void HMI_Process_Init(bsp_length_result_t length_init_result)
 {
     bsp_flash_result_t flash_result;
 
-    g_calibration = s_factory_calibration;
+    app_set_factory_calibration();
     memset(&g_measure_context, 0, sizeof(g_measure_context));
     g_length_init_result = length_init_result;
 
@@ -154,9 +162,20 @@ void HMI_Process_Init(bsp_length_result_t length_init_result)
          * 擦除态或损坏记录都使用valid_mask=0的安全RAM副本。
          * 原始采集仍可运行，且初始化阶段不会自动擦写Flash。
          */
-        g_calibration = s_factory_calibration;
+        app_set_factory_calibration();
         Debug_printf("[FLASH] no valid calibration, result=%u, raw mode\r\n",
                      (unsigned int)flash_result);
+    }
+
+    /*
+     * 兼容旧版Flash记录：CRC正确但参考电阻字段为空、为负或为NaN时，
+     * 仅在RAM中回退到已确认的62欧，不自动擦写用户的标定扇区。
+     */
+    if (!(g_calibration.resistance_reference_ohm > 0.0f))
+    {
+        g_calibration.resistance_reference_ohm =
+            APP_FACTORY_RESISTANCE_REFERENCE_OHM;
+        Debug_printf("[CAL] invalid resistance reference, use 62 ohm\r\n");
     }
 
     Debug_printf("[GP22] init result=%u\r\n",
